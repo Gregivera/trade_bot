@@ -41,11 +41,11 @@ Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 session = Session()
 
-session.query(Trade).delete()
-session.commit()  # Make sure to commit the changes
+# session.query(Trade).delete()
+# session.commit()  # Make sure to commit the changes
 
 # Initialize exchange connection
-exchange = ccxt.binance({
+exchange = ccxt.binanceus({
     'enableRateLimit': True,
     'apiKey': os.getenv('BINANCE_API_KEY'),
     'secret': os.getenv('BINANCE_SECRET')
@@ -53,7 +53,7 @@ exchange = ccxt.binance({
 
 # Define the trading pair and indicators
 pair = 'ETH/USDT'
-timeframe = '30m'
+timeframe = '15m'
 periods = 100
 
 # Contract parameters
@@ -93,9 +93,11 @@ def calculate_atr(df, period=14):
 
 # Function to fetch data and calculate signal
 async def generate_signal():
+    # Fetch OHLCV data
     ohlcv = exchange.fetch_ohlcv(pair, timeframe, limit=periods)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     
+    # Calculate indicators
     df['EMA25'] = calculate_ema(df['close'], 25)
     df['RSI4'] = await calculate_rsi(df['close'], 4)
     df['CCI10'] = await calculate_cci(df, 10)
@@ -103,171 +105,112 @@ async def generate_signal():
 
     latest = df.iloc[-1]
     signal = None
-    tp = None  
-    sl = None  
 
+    # Generate signal based on indicators
     if latest['RSI4'] < 30 and latest['CCI10'] < -100 and latest['close'] < latest['EMA25']:
-        tp = latest['close'] - (1.5 * latest['ATR14'])
-        sl = latest['close'] + (1.5 * latest['ATR14'])
         signal = 'SELL'
-
     elif latest['RSI4'] > 70 and latest['CCI10'] > 100 and latest['close'] > latest['EMA25']:
-        tp = latest['close'] + (1.5 * latest['ATR14'])   
-        sl = latest['close'] - (1.5 * latest['ATR14'])
         signal = 'BUY'
 
-    return signal, latest['close'], tp, sl
+    # Return signal and ATR
+    return signal, latest['ATR14']
+
+def get_current_price():
+    # Replace `pair` with your trading pair (e.g., 'BTC/USDT') and `exchange` with your exchange object
+    ticker =  exchange.fetch_ticker(pair)
+    return ticker['last']  # Return the last traded price
+
+uniswap_router = Localweb3.eth.contract(address=UNISWAP_V2_ROUTER, abi=UNISWAP_V2_ABI)
 
 
 # Main routine to periodically check for signals and execute trades
 async def main():
     global trade_id, entry_price
 
-    # take_snapshot()
     while True:
-        signal, price, tp, sl = await generate_signal()
+        # Generate a signal and get the relevant ATR
+        signal, atr = await generate_signal()
 
-        print(f"There is a {signal} signal")
+        # Fetch the current price
+        price = get_current_price()
 
-        # Check if there's an open trade
-        open_trade_exists = session.query(Trade).filter_by(is_open=True).first()
+        print(f"Signal generated: {signal} at price {price} with ATR {atr}")
 
-        if signal is not None and not open_trade_exists:
-            # Reset the Hardhat node before proceeding
-            # revert_to_snapshot()
-            print(f"Executing {signal} at {price}.")
-            hash = 0x00000000000000000000000000000000000000
+        # Check if there are existing open trades
+        open_trades = session.query(Trade).filter_by(is_open=True).all()
 
-            # Save the trade to the database
-            new_trade = Trade(
-                signal=signal,
-                price=price,
-                tp=tp,
-                sl=sl,
-                trade_id=hash,
-                is_open=True
-            )
-            session.add(new_trade)
-            session.commit()  # Save the changes to the database
-            print(f"Trade saved with ID {new_trade.id}")
+        if len(open_trades) < 2:
+            if signal is not None:
+                # Calculate TP and SL based on the ATR
+                if signal == 'BUY':
+                    tp = price + (2 * atr)  # Take profit is 2x ATR above the entry price
+                    sl = price - (1 * atr)  # Stop loss is 1x ATR below the entry price
+                elif signal == 'SELL':
+                    tp = price - (2 * atr)  # Take profit is 2x ATR below the entry price
+                    sl = price + (1 * atr)  # Stop loss is 1x ATR above the entry price
+
+                # Place Buy and Sell trades
+                buy_trade = Trade(
+                    signal='BUY',
+                    price=price,
+                    tp=price + (2 * atr),  # TP for BUY trade
+                    sl=price - (atr),  # SL for BUY trade
+                    is_open=True
+                )
+
+                session.add(buy_trade)
+                print(f"Buy Trade Stored: Entry Price={price}, TP={buy_trade.tp}, SL={buy_trade.sl}, ATR={atr}")
+
+                sell_trade = Trade(
+                    signal='SELL',
+                    price=price,
+                    tp=price - (2 * atr),  # TP for SELL trade
+                    sl=price + (atr),  # SL for SELL trade
+                    is_open=True
+                )
+
+                session.add(sell_trade)
+                print(f"Sell Trade Stored: Entry Price={price}, TP={sell_trade.tp}, SL={sell_trade.sl}, ATR={atr}")
+
+                session.commit()
+
+                print(f"Placed Buy and Sell trades: {buy_trade}, {sell_trade}")
+
         else:
-            print(f"Open trade exists: {open_trade_exists}")
+            print("Two trades are already active. Monitoring them.")
 
-        if open_trade_exists:
-            # Assuming you have a way to get the current price in the context of this check
-            current_price = price 
+        # Monitor trades for closure
+        for trade in open_trades:
+            current_price = get_current_price()
 
-            # If the signal is 'BUY' and the current price is greater or less than the stop loss
-            if open_trade_exists.signal == 'BUY':
-                if current_price > open_trade_exists.tp:
-                    print(f"Take Profit for Buy Trade Hit: price:{current_price}.")
+            if trade.signal == 'BUY':
+                if current_price >= trade.tp:
+                    print(f"Take Profit Hit for Buy trade at {current_price}")
+                    trade.equity = current_price - trade.price
+                    trade.is_open = False
+                elif current_price <= trade.sl:
+                    print(f"Stop Loss Hit for Buy trade at {current_price}")
+                    trade.equity = current_price - trade.price
+                    trade.is_open = False
+            elif trade.signal == 'SELL':
+                if current_price <= trade.tp:
+                    print(f"Take Profit Hit for Sell trade at {current_price}")
+                    trade.equity = trade.price - current_price
+                    trade.is_open = False
+                elif current_price >= trade.sl:
+                    print(f"Stop Loss Hit for Sell trade at {current_price}")
+                    trade.equity = trade.price - current_price
+                    trade.is_open = False
 
-                    # Reset the Hardhat node before proceeding
-                    # revert_to_snapshot()
+            if not trade.is_open:
+                session.add(trade)
+                session.commit()
+                print(f"Closed trade: {trade}")
 
-                    pl = current_price - open_trade_exists.price
+        # Calculate total equity
+        total_equity = session.query(func.sum(Trade.equity)).scalar() or 0
+        print(f"Total Equity: {total_equity}")
 
-                    open_trade_exists.equity = pl
-
-                    open_trade_exists.is_open = False
-
-                    print("Trade Closed")
-
-                    print(f"Trade Objects are {open_trade_exists}")
-                    # # Action: Close the trade, alert the user, etc.
-                    # close_trade(open_trade_exists.id)
-
-                    # Query to sum the equity of all trades
-                    total_equity = session.query(func.sum(Trade.equity)).scalar()
-
-                    print(f"Total Equity: {total_equity}")
-
-                    # Commit the updated equity to the database
-                    session.add(open_trade_exists)
-                    session.commit()
-
-                if current_price < open_trade_exists.sl:
-                    print(f"Stop Loss for Buy Trade Hit: price:{current_price}.")
-
-                    # Reset the Hardhat node before proceeding
-                    # revert_to_snapshot()
-
-                    print(f"Trade Objects are {open_trade_exists}")
-
-                    pl = current_price - open_trade_exists.price
-
-                    open_trade_exists.equity = pl
-                    open_trade_exists.is_open = False
-                    print("Trade Closed")
-
-                    total_equity = session.query(func.sum(Trade.equity)).scalar()
-
-                    print(f"Total Equity: {total_equity}")
-                    # Action: Close the trade, alert the user, etc.
-                    # close_trade(open_trade_exists.id)
-
-                    # Commit the updated equity to the database
-                    session.add(open_trade_exists)
-                    session.commit()
-                    # Query to sum the equity of all trades
-                    
-                else:
-                    print(f"Current price {current_price} is within safe range. No action needed.")
-            else:
-                if current_price < open_trade_exists.tp:
-                    print(f"Take Profit for Sell Trade Hit: price:{current_price}.")
-
-                    # Reset the Hardhat node before proceeding
-                    # revert_to_snapshot()
-
-                    print(f"Trade Objects are {open_trade_exists}")
-
-                    pl = open_trade_exists.price - current_price
-
-                    open_trade_exists.equity = pl
-
-                    open_trade_exists.is_open = False
-                    print("Trade Closed")
-
-                    # Action: Close the trade, alert the user, etc.
-                    # close_trade(open_trade_exists.id)
-
-                    
-                    # Commit the updated equity to the database
-                    session.add(open_trade_exists)
-                    session.commit()
-                    # Query to sum the equity of all trades
-                    total_equity = session.query(func.sum(Trade.equity)).scalar()
-
-                    print(f"Total Equity: {total_equity}")
-
-                if current_price > open_trade_exists.sl:
-                    print(f"Stop Loss for Sell Trade Hit: price:{current_price}.")
-
-                    # Reset the Hardhat node before proceeding
-                    # revert_to_snapshot()
-
-                    print(f"Trade Objects are {open_trade_exists}")
-
-                    pl = open_trade_exists.price - current_price
-
-                    open_trade_exists.equity = pl
-                    open_trade_exists.is_open = False
-                    print("Trade Closed")
-
-                    # Action: Close the trade, alert the user, etc.
-                    # close_trade(open_trade_exists.id)
-                    
-                    # Commit the updated equity to the database
-                    session.add(open_trade_exists)
-                    session.commit()
-                    # Query to sum the equity of all trades
-                    total_equity = session.query(func.sum(Trade.equity)).scalar()
-
-                    print(f"Total Equity: {total_equity}")
-                else:
-                    print(f"Current price {current_price} is within safe range. No action needed.")
-
-        await asyncio.sleep(60) 
-
+        await asyncio.sleep(150)
+        
 asyncio.run(main())
